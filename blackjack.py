@@ -36,6 +36,20 @@ class RewardsTable:
                                    'reward': k if k < 21 else (1000 if k == 21 else -1000)})
 
 
+# this version considers the dealer's state to know if the player has won or lost
+class RewardsTableV2:
+    def __init__(self):
+        self.table = list()
+        for i in range(1, 23): # dealer states go up to 22 to account for the dealer bust condition
+            for j in range(1, 22):
+                self.table.append({'dealer_state': i, 'current_state': j, 'next_state': j,
+                                   'action': 'stand', 'reward': 1000 if j > i else -1000})
+
+                for k in range(j * -1 + 1, 12):
+                    self.table.append({'dealer_state': i, 'current_state': j, 'next_state': j+k, 'action': 'hit',
+                                       'reward': 1000 if j+k > i and j+k <= 21 else (-1000 if j+k > 21 else j+k)})
+
+
 class QTable:
     def __init__(self):
         self.table = list()
@@ -95,8 +109,12 @@ class PolicyGambler(Player):
         self.policy = policy
 
     def should_hit(self):
-        action = next(filter(lambda x: x['state'] == self.score_hand(), self.policy))[
-            'action']
+        score = self.score_hand()
+        if score < 22:
+            action = next(filter(lambda x: x['state'] == self.score_hand(), self.policy))[
+                'action']
+        else:
+            action = 'stand'
         return action == 'hit'
 
 
@@ -131,11 +149,15 @@ class Dealer(Player):
 
 
 class Game:
-    def __init__(self):
+    def __init__(self, policy=None):
         self.deck = Deck()
+        self.policy = policy
 
     def play_hand(self):
-        self.player = DumbGambler(self.deck)
+        if not self.policy:
+            self.player = DumbGambler(self.deck)
+        else:
+            self.player = PolicyGambler(self.deck, self.policy)
         self.dealer = Dealer(self.deck)
         while self.player.should_hit() and self.player.score_hand() <= 21:
             self.player.hit()
@@ -164,6 +186,7 @@ class Game:
 class QLearningTrainer:
     def __init__(self, alpha=0.1, lamda=0.1, epsilon=0.1):
         self.rewards_table = RewardsTable().table
+        self.rewards_table_v2 = RewardsTableV2().table
         self.q_table = QTable().table
         self.alpha = alpha
         # [sic]; can't use `lambda` bc it's a Python keyword
@@ -222,6 +245,52 @@ class QLearningTrainer:
             while self.dealer.should_hit() and self.dealer.score_hand() <= 21:
                 self.dealer.hit()
 
+    def optimize_q_table_v2(self):
+        deck = Deck()
+        for i in range(10000):
+            self.player = QLearningGambler(deck, self.q_table, self.epsilon)
+            self.dealer = Dealer(deck)
+
+            while self.dealer.should_hit() and self.dealer.score_hand() <= 21:
+                self.dealer.hit()
+
+            dealer_state = self.dealer.score_hand()
+            if dealer_state >= 22:
+                dealer_state = 22
+
+            while self.player.score_hand() <= 21 and self.player.should_hit():
+                current_state = self.player.score_hand()
+                current_state_q_table_entry = next(
+                    filter(lambda x: x['state'] == current_state and x['action'] == 'hit', self.q_table))
+                current_state_q = current_state_q_table_entry['q']
+                self.player.hit()
+                # optimize q-table for hit action
+                result_state = self.player.score_hand()
+                reward = next(filter(lambda x: x['current_state'] == current_state and x['next_state']
+                                     == result_state and x['action'] == 'hit' and x['dealer_state'] == dealer_state, self.rewards_table_v2))['reward']
+                assoc_action_and_q = self.get_association_action_and_q(
+                    result_state)
+                new_q = (1 - self.alpha) * current_state_q + self.alpha * \
+                    (reward + self.lamda * assoc_action_and_q[1])
+                current_state_q_table_entry['q'] = new_q
+
+            # optimize q-table for stand action if the game isn't over
+            current_state = self.player.score_hand()
+            if current_state <= 21:
+                current_state_q_table_entry = next(
+                    filter(lambda x: x['state'] == current_state and x['action'] == 'stand', self.q_table))
+                current_state_q = current_state_q_table_entry['q']
+                # self.player.stand() # this isn't a real function, just saying this is where the player "stands"
+                # we're standing, so the score (state) doesn't change
+                result_state = current_state
+                reward = next(filter(lambda x: x['current_state'] == current_state and x['next_state']
+                                     == result_state and x['action'] == 'stand' and x['dealer_state'] == dealer_state, self.rewards_table_v2))['reward']
+                assoc_action_and_q = self.get_association_action_and_q(
+                    result_state)
+                new_q = (1 - self.alpha) * current_state_q + self.alpha * \
+                    (reward + self.lamda * assoc_action_and_q[1])
+                current_state_q_table_entry['q'] = new_q
+
     def compile_policy_from_trained_q_table(self):
         policy = list()
         self.q_table.sort(key=lambda x: x['state'])
@@ -229,7 +298,8 @@ class QLearningTrainer:
         for k, v in groups:
             v_list = list(v)
             hit_q = next(filter(lambda x: x['action'] == 'hit', v_list))['q']
-            stand_q = next(filter(lambda x: x['action'] == 'stand', v_list))['q']
+            stand_q = next(
+                filter(lambda x: x['action'] == 'stand', v_list))['q']
             if hit_q > stand_q:
                 policy.append({'state': k, 'action': 'hit'})
             elif hit_q < stand_q:
